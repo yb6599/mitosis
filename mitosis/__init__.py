@@ -1,13 +1,15 @@
 import logging
-import pickle
-import re
+import pprint
 import sys
 import warnings
+from abc import ABCMeta
 from collections import OrderedDict
 from dataclasses import dataclass
 from dataclasses import field
 from datetime import datetime
 from datetime import timezone
+from importlib.metadata import packages_distributions
+from importlib.metadata import version
 from pathlib import Path
 from time import process_time
 from types import BuiltinFunctionType
@@ -21,15 +23,19 @@ from typing import Hashable
 from typing import List
 from typing import Mapping
 from typing import Optional
+from typing import Protocol
+from typing import Sequence
 
+import dill  # type: ignore
 import git
-import nbclient
+import nbclient.exceptions
 import nbformat
 import pandas as pd
+import sqlalchemy as sql
 from nbconvert.exporters import HTMLExporter
 from nbconvert.preprocessors import ExecutePreprocessor
-from nbconvert.writers import FilesWriter
-from numpy import array  # noqa: F401 used in an eval() in _parse_results()
+from nbconvert.writers.files import FilesWriter
+from numpy import array  # noqa: F401 used in an eval() for result string
 from numpy.random import choice
 from sqlalchemy import Column
 from sqlalchemy import create_engine
@@ -43,16 +49,24 @@ from sqlalchemy import String
 from sqlalchemy import Table
 from sqlalchemy import update
 
-REPO = git.Repo(Path.cwd(), search_parent_directories=True)
 
-ModuleInfo = list[tuple[ModuleType, Optional[Collection[str]]]]
+class _ExpRun(Protocol):
+    def __call__(self, *args: Any) -> dict:
+        ...
+
+
+class Experiment(ModuleType, metaclass=ABCMeta):
+    __name__: str
+    __file__: str
+    name: str
+    lookup_dict: dict[str, dict[str, Any]]
+    run: _ExpRun
 
 
 def trials_columns():
     return [
         Column("variant", Integer, primary_key=True),
         Column("iteration", Integer, primary_key=True),
-        Column("seed", Integer, primary_key=True),
         Column("commit", String, nullable=False),
         Column("cpu_time", Float),
         Column("results", String),
@@ -72,27 +86,61 @@ class Parameter:
     """An experimental parameter
 
     Arguments:
-        id_name: short name for the variant (particular values) across use cases
+        var_name: short name for the variant (particular values) across use cases
         arg_name: name of arg known to experiment
         vals: value of the parameter
-        modules: module names required in order to use the values.  Since arguments
-            can only be passed to notebooks as strings, any argument that cannot be
-            simply recreated from its repr will need to be pickled and the containing
-            module imported.
+        eval: whether variant name should be evaluated or looked up.
     """
 
-    id_name: str
+    var_name: str
     arg_name: str
     vals: Any
-    modules: List[str] = field(default_factory=list)
+    # > 3.10 only: https://stackoverflow.com/a/49911616/534674
+    evaluate: bool = field(default=False, kw_only=True)
 
 
-def _finalize_param(param: Parameter, folder: Path | str):
-    filename = "arg" + "".join(choice(list("0123456789abcde"), 9)) + ".pickle"
-    location = Path(folder) / filename
-    with open(location, "wb") as fh:
-        pickle.dump(param.vals, fh)
-    return location
+def load_trial_data(hexstr: str, *, trials_folder: Optional[Path | str] = None):
+    trial = _locate_trial_folder(hexstr, trials_folder=trials_folder)
+    with open(trial / "results.dill", "rb") as fh:
+        return dill.load(fh)
+
+
+def _locate_trial_folder(
+    hexstr: str, *, trials_folder: Optional[Path | str] = None
+) -> Path:
+    if trials_folder is None:
+        trials_folder = Path().absolute()
+    else:
+        trials_folder = Path(trials_folder).resolve()
+    matches = trials_folder.glob(f"*{hexstr}")
+    try:
+        first = next(matches)
+    except StopIteration:
+        raise FileNotFoundError(f"Could not find a trial that matched {hexstr}")
+    try:
+        next(matches)
+    except StopIteration:
+        return first
+    raise RuntimeError(f"Two or more matches found for {hexstr}")
+
+
+def _split_param_str(paramstr: str) -> tuple[bool, str, str]:
+    arg_name, var_name = paramstr.split("=")
+    track = True
+    if arg_name[0] == "+":
+        track = False
+        arg_name = arg_name[1:]
+    return track, arg_name, var_name
+
+
+def _resolve_param(
+    arg_name: str, var_name: str, lookup_dict: dict[str, Any]
+) -> Parameter:
+    stored = lookup_dict[arg_name][var_name]
+    if isinstance(stored, Parameter):
+        return Parameter(var_name, arg_name, stored.vals, evaluate=False)
+    else:
+        return Parameter(var_name, arg_name, stored, evaluate=False)
 
 
 class DBHandler(logging.Handler):
@@ -122,6 +170,7 @@ class DBHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord):
         vals = self.parse_record(record.getMessage())
+        stmt: sql.Insert | sql.Update
         if "insert" in vals[0]:
             stmt = insert(self.log_table)
             for i, col in enumerate(self.log_table.columns):
@@ -142,11 +191,6 @@ class DBHandler(logging.Handler):
 
     def parse_record(self, msg: str) -> List[str]:
         return msg.split(self.separator)
-
-
-class Experiment:
-    def run():
-        raise NotImplementedError
 
 
 def _init_logger(trial_log, table_name, debug):
@@ -180,6 +224,7 @@ def _verify_variant_name(trial_db: Path, param: Parameter) -> None:
     eng = create_engine("sqlite:///" + str(trial_db))
     md = MetaData()
     tb = Table(f"variant_{param.arg_name}", md, *variant_types())
+    vals: Collection[Any]
     if isinstance(param.vals, Mapping):
         vals = StrictlyReproduceableDict({k: v for k, v in sorted(param.vals.items())})
     elif isinstance(param.vals, Collection) and not isinstance(param.vals, str):
@@ -190,13 +235,14 @@ def _verify_variant_name(trial_db: Path, param: Parameter) -> None:
     else:
         vals = param.vals
     df = pd.read_sql(select(tb), eng)
-    ind_equal = df.loc[:, "name"] == param.id_name
+    ind_equal = df.loc[:, "name"] == param.var_name
     if ind_equal.sum() == 0:
-        stmt = insert(tb, values={"name": param.id_name, "params": str(vals)})
-        eng.execute(stmt)
+        stmt = tb.insert().values({"name": param.var_name, "params": str(vals)})
+        with eng.connect() as conn:
+            conn.execute(stmt)
     elif df.loc[ind_equal, "params"].iloc[0] != str(vals):
         raise RuntimeError(
-            f"Parameter '{param.arg_name}' variant '{param.id_name}' "
+            f"Parameter '{param.arg_name}' variant '{param.var_name}' "
             f"is stored with different values in {trial_db}, table '{tb}'. "
             f"(Stored: {df.loc[ind_equal, 'params'].iloc[0]}), attmpeted: {str(vals)}."
         )
@@ -227,20 +273,49 @@ def _id_variant_iteration(trial_log, trials_table, master_variant: str) -> int:
         return df["iteration"].max() + 1
 
 
+def _identify_cwd_commit_hash() -> str:
+    repo = git.Repo(Path.cwd(), search_parent_directories=True)
+    if repo.is_dirty():
+        raise RuntimeError(
+            "Git Repo is dirty.  For repeatable tests,"
+            " clean the repo by committing or stashing all changes and "
+            "untracked files."
+        )
+    return repo.head.commit.hexsha
+
+
+def _lock_in_variant(
+    params: Sequence[Parameter],
+    untracked_params: Collection[str],
+    trial_db: Path,
+    debug: bool,
+) -> str:
+    for param in params:
+        if debug or param.arg_name in untracked_params:
+            continue
+        _init_variant_table(trial_db, param)
+        _verify_variant_name(trial_db, param)
+    var_names = [param.var_name for param in params]
+    arg_names = [param.arg_name for param in params]
+    if not arg_names:
+        return "noparams"
+    return "-".join(
+        [x for _, x in sorted(zip(arg_names, var_names), key=lambda pair: pair[0])]
+    )
+
+
 def run(
     ex: Experiment,
-    debug=False,
-    seed=1,
+    debug: bool = False,
     *,
-    group=None,
-    logfile="trials.db",
-    params: List[Parameter] = None,
-    trials_folder=Path(__file__).absolute().parent / "trials",
+    group: str | None = None,
+    logfile: Path | str = "trials.db",
+    params: Sequence[Parameter] = (),
+    trials_folder: Path | str = Path(__file__).absolute().parent / "trials",
     output_extension: str = "html",
-    addl_mods_and_names: ModuleInfo = None,
-    untracked_params: Collection[str] = None,
+    untracked_params: Collection[str] = (),
     matplotlib_dpi: int = 72,
-):
+) -> str:
     """Run the selected experiment.
 
     Arguments:
@@ -255,58 +330,53 @@ def run(
         trials_folder (path-like): The folder to store both output and
             logfile.
         output_extension: what output type to produce using nbconvert.
-        addl_mods_and_names: Additional modules names required to
-            run experiment as well as names from those modules.
         untracked_params: names of parameters to not track in database
         matplotlib_resolution: dpi for matplotlib images.  Not yet
             functional.
+
+    Returns:
+        The pseudorandom key to this experiment
     """
-    if not debug and REPO.is_dirty():
-        raise RuntimeError(
-            "Git Repo is dirty.  For repeatable tests,"
-            " clean the repo by committing or stashing all changes and "
-            "untracked files."
-        )
-    trial_db = Path(trials_folder).absolute() / logfile
+
+    if debug:
+        commit = "0000000"
+    else:
+        commit = _identify_cwd_commit_hash()
+
+    trials_folder = Path(trials_folder).absolute()
+    trial_db = trials_folder / logfile
+    master_variant = _lock_in_variant(params, untracked_params, trial_db, debug)
+
     table_name = f"trials_{ex.name}"
+    params = list(params)
     if group is not None:
         table_name += f" {group}"
-    exp_logger, trials_table = _init_logger(trial_db, f"trials_{ex.name}", debug)
-    for param in params:
-        if param.arg_name in untracked_params:
-            continue
-        _init_variant_table(trial_db, param)
-        _verify_variant_name(trial_db, param)
-    id_names = [param.id_name for param in params]
-    arg_names = [param.arg_name for param in params]
-    master_variant = "-".join(
-        [x for _, x in sorted(zip(arg_names, id_names), key=lambda pair: pair[0])]
+        params.append(Parameter(f"'{group}'", "group", group, evaluate=True))
+    exp_logger, trials_table = _init_logger(trial_db, table_name, debug)
+    iteration = (
+        0 if debug else _id_variant_iteration(trial_db, trials_table, master_variant)
     )
-
-    iteration = _id_variant_iteration(trial_db, trials_table, master_variant)
-    debug_suffix = "_" + "".join(choice(list("0123456789abcde"), 6))
     new_filename = f"trial_{ex.name}"
     if group is not None:
         new_filename += f"_{group}"
-    new_filename += f"_{master_variant}_{iteration}"
+    rand_key = "".join(choice(list("0123456789abcde"), 6))
+    new_filename += f"_{master_variant}_{iteration}_{rand_key}"
     if debug:
-        new_filename += debug_suffix
+        new_filename += "debug"
     if output_extension is None:
         new_filename = None
     elif output_extension == "html":
         new_filename += ".html"
     elif output_extension == "ipynb":
         new_filename += ".ipynb"
-    commit = REPO.head.commit.hexsha
     exp_logger.info(
         "trial entry: insert"
         + f"--{master_variant}"
         + f"--{iteration}"
-        + f"--{seed}"
         + f"--{commit}"
         + "--"
         + "--"
-        + "--None"
+        + "--"
     )
     utc_now = datetime.now(timezone.utc)
     cpu_now = process_time()
@@ -320,15 +390,20 @@ def run(
         log_msg += ".  In debugging mode."
     exp_logger.info(log_msg)
 
+    exp_metadata_name = (
+        datetime.now().astimezone().strftime(r"%Y-%m-%d") + f"_{rand_key}"
+    )
+    exp_metadata_folder = trials_folder / exp_metadata_name
+    exp_metadata_folder.mkdir()
+    _write_freezefile(exp_metadata_folder)
+
     nb, metrics, exc = _run_in_notebook(
         ex,
-        seed,
-        group,
-        params,
-        trials_folder,
-        addl_mods_and_names,
-        debug_suffix,
+        {p.arg_name: p.var_name for p in params if not p.evaluate},
+        {p.arg_name: p.var_name for p in params if p.evaluate},
+        exp_metadata_folder,
         matplotlib_dpi,
+        debug=debug,
     )
 
     utc_now = datetime.now(timezone.utc)
@@ -341,6 +416,7 @@ def run(
 
     if new_filename is not None:
         _save_notebook(nb, new_filename, trials_folder, output_extension)
+        (exp_metadata_folder / "experiment").symlink_to(trials_folder / new_filename)
     else:
         warnings.warn("Logging trial and mock filename, but no file created")
 
@@ -348,7 +424,6 @@ def run(
         "trial entry: update"
         + f"--{master_variant}"
         + f"--{iteration}"
-        + f"--{seed}"
         + f"--{commit}"
         + f"--{cpu_time}"
         + f"--{metrics}"
@@ -356,84 +431,76 @@ def run(
     )
     if exc is not None:
         raise exc
+    return rand_key
 
 
 def _run_in_notebook(
-    ex: type,
-    seed,
-    group,
-    params,
+    ex: Experiment,
+    lookup_params: dict[str, str],
+    eval_params: dict[str, str],
     trials_folder,
-    addl_mods_and_names: ModuleInfo,
-    results_suffix: str,
     matplotlib_dpi=72,
-):
-    run_args = {param.arg_name: param.vals for param in params if not param.modules}
-    run_args["seed"] = seed
-    if group is not None:
-        run_args["group"] = group
-
-    pickles = {
-        param.arg_name: str(_finalize_param(param, trials_folder))
-        for param in params
-        if param.modules
-    }
-    mod_names_and_paths = [
-        (mod.__name__, mod.__file__, []) for param in params for mod in param.modules
-    ]
-    mod_names_and_paths += [
-        (mod.__name__, mod.__file__, names) for mod, names in addl_mods_and_names
-    ]
+    debug: bool = False,
+) -> tuple[nbformat.NotebookNode, Optional[str], Optional[Exception]]:
+    ex_module = ex.__name__
+    ex_file = ex.__file__
     code = (
         "import importlib\n"
+        "import logging\n"
         "import matplotlib as mpl\n"
-        "import numpy as np\n"
-        "import pickle\n"
+        "import dill\n"
         "import sys\n\n"
-        f"mods = {mod_names_and_paths}\n"
-        "for modname, mod_path, names in mods:\n"
-        "  mod = importlib.import_module(modname, str(mod_path))\n"
-        "  for name in names:\n"
-        "    globals()[name] = vars(mod)[name]\n"
-        f'module = importlib.import_module("{ex.__name__}")\n\n'
-        "def unpickle(file):\n"
-        "  with open(file, 'rb') as fh:\n"
-        "    obj = pickle.load(fh)\n"
-        "  return obj\n\n"
-        f"args = {run_args}\n"
-        f"pickles = {pickles}\n"
-        "for a_name, a_pickle in pickles.items():\n"
-        f"  args[a_name] = unpickle(a_pickle)\n\n"
+        f"ex = importlib.import_module('{ex_module}', '{ex_file}')\n\n"
         f"mpl.rcParams['figure.dpi'] = {matplotlib_dpi}\n"
         f"mpl.rcParams['savefig.dpi'] = {matplotlib_dpi}\n"
-        f"print(r'Imported {ex.name} from {ex.__file__}')\n"
-        'print(f"Running {module.__name__}.run() with parameters {args}")\n'
-        'seed = args.pop("seed")\n'
+        f"logger = logging.getLogger('{ex_module}')\n"
+        'print(f"Running {ex.name}.run()")\n'
     )
+    code += (
+        "logger.setLevel(logging.DEBUG)\n"
+        if debug
+        else "logger.setLevel(logging.INFO)\n"
+    )
+    logfile = trials_folder / f"{ex_module}.log"
+    code += f"logger.addHandler(logging.FileHandler('{logfile}', delay=True))\n"
 
     nb = nbformat.v4.new_notebook()
     setup_cell = nbformat.v4.new_code_cell(source=code)
-    run_cell = nbformat.v4.new_code_cell(source="results = module.run(seed, **args)")
-    final_cell = nbformat.v4.new_code_cell(
+    resolve_code = (
+        "import mitosis\n"
+        "from pathlib import Path\n"
+        "resolved_args = {}\n"
+        f"for arg_name, var_name in {lookup_params}.items():\n"
+        "    val = mitosis._resolve_param(arg_name, var_name, ex.lookup_dict).vals\n"
+        "    resolved_args.update({arg_name: val}) \n"
+        "    print(arg_name,'=',resolved_args[arg_name])\n\n"
+        f"for arg_name, var_name in {eval_params}.items():\n"
+        "    val = eval(var_name)\n"
+        "    resolved_args.update({arg_name: val}) \n"
+        "    print(arg_name,'=',resolved_args[arg_name])\n\n"
+        f"mitosis._prettyprint_config(Path('{trials_folder}'), resolved_args)\n"
+        f"print('Saving metadata to {trials_folder}')\n"
+    )
+    resolve_cell = nbformat.v4.new_code_cell(source=resolve_code)
+    run_cell = nbformat.v4.new_code_cell(source="results = ex.run(**resolved_args)")
+    result_cell = nbformat.v4.new_code_cell(
         source=""
-        f"with open(r'{trials_folder / ('results'+results_suffix+'.npy')}', 'wb') as f:\n"  # noqa E501
-        "  np.save(f, results)\n"
+        f"with open(r'{trials_folder / ('results.dill')}', 'wb') as f:\n"  # noqa E501
+        "  dill.dump(results, f)\n"
         "print(repr(results))\n"
     )
-    nb["cells"] = [setup_cell, run_cell, final_cell]
+    metrics_cell = nbformat.v4.new_code_cell(source="print(results['main'])")
+    nb["cells"] = [setup_cell, resolve_cell, run_cell, result_cell, metrics_cell]
 
     kernel_name = _create_kernel()
     ep = ExecutePreprocessor(timeout=-1, kernel=kernel_name)
     exception = None
+    metrics = None
     try:
         ep.preprocess(nb, {"metadata": {"path": trials_folder}})
-    except nbclient.client.CellExecutionError as exc:
+        metrics = nb["cells"][-1]["outputs"][0]["text"][:-1]
+    except nbclient.exceptions.CellExecutionError as exc:
         exception = exc
-    try:
-        result_string = nb["cells"][2]["outputs"][0]["text"][:-1]
-        metrics = _parse_results(result_string)
-    except (IndexError, KeyError):
-        metrics = None
     return nb, metrics, exception
 
 
@@ -460,11 +527,6 @@ def _save_notebook(nb, filename, trials_folder, extension):
             nbformat.write(nb, f)
     else:
         raise ValueError
-
-
-def _parse_results(result_string):
-    match = re.search(r"'main': (.*)}", result_string, re.DOTALL)
-    return match.group(1)
 
 
 def cleanstr(obj):
@@ -537,3 +599,17 @@ class StrictlyReproduceableList(List):
         else:
             string = string[:-2] + "]"
         return string
+
+
+def _write_freezefile(folder: Path):
+    installed = {pkg for pkgs in packages_distributions().values() for pkg in pkgs}
+    req_str = f"# {sys.version}\n"
+    req_str += "\n".join(f"{pkg}=='{version(pkg)}'" for pkg in installed)
+    with open(folder / "requirements.txt", "w") as f:
+        f.write(req_str)
+
+
+def _prettyprint_config(folder: Path, params: Collection[Parameter]):
+    pretty = pprint.pformat(params)
+    with open(folder / "config.txt", "w") as f:
+        f.write(pretty)
