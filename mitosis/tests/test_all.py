@@ -1,17 +1,19 @@
-import subprocess
+import pickle
 import sys
+from pathlib import Path
 from types import ModuleType
-from typing import cast
 
 import nbclient.exceptions
 import pytest
 
 import mitosis
-from mitosis.tests import bad_return_experiment
-from mitosis.tests import mock_experiment
-
-mock_experiment = cast(mitosis.Experiment, mock_experiment)
-bad_return_experiment = cast(mitosis.Experiment, bad_return_experiment)
+from mitosis import _disk
+from mitosis import unpack
+from mitosis._typing import ExpStep
+from mitosis._typing import Parameter
+from mitosis.tests import mock_paper
+from mitosis.tests import mock_part1
+from mitosis.tests import mock_part2
 
 
 def test_reproduceable_dict():
@@ -92,10 +94,6 @@ def test_unreproduceable_dict():
         str(mitosis.StrictlyReproduceableDict(**{"1": lambda x: 1}))
 
 
-def test_kernel_name():
-    mitosis._create_kernel()
-
-
 @pytest.fixture
 def fake_eval_param():
     return mitosis.Parameter("1", "seed", 1, evaluate=True)
@@ -106,82 +104,150 @@ def fake_lookup_param():
     return mitosis.Parameter("test", "foo", 2, evaluate=False)
 
 
-@pytest.mark.parametrize(
-    "param",
-    (
-        pytest.lazy_fixture("fake_eval_param"),  # type: ignore
-        pytest.lazy_fixture("fake_lookup_param"),  # type: ignore
-    ),
-)
-def test_empty_mod_experiment(tmp_path, param):
-    mitosis.run(
-        mock_experiment,
+@pytest.fixture()
+def mock_steps():
+    return [
+        # fmt: off
+        ExpStep(
+            "foo",
+            mock_part1.Klass.gen_data, "mitosis.tests.mock_part1:Klass.gen_data",
+            mock_paper.data_config, "mitosis.tests.mock_paper:data_config",
+            None,
+            [
+                Parameter("test", "length", 5, evaluate=False),
+                Parameter("True", "extra", True, evaluate=True),
+            ],
+            []
+        ),
+        ExpStep(
+            "bar",
+            mock_part2.fit_and_score, "mitosis.tests.mock_part2:fit_and_score",
+            mock_paper.meth_config, "mitosis.tests.mock_paper:meth_config",
+            None,
+            [
+                Parameter("test", "metric", "len", evaluate=False),
+            ],
+            []
+        )
+        # fmt: on
+    ]
+
+
+def test_mock_experiment(mock_steps, tmp_path):
+    exp_key = mitosis.run(
+        mock_steps,
         debug=True,
         trials_folder=tmp_path,
-        params=[param],
     )
+    data = mitosis.load_trial_data(exp_key, trials_folder=tmp_path)
+    assert len(data[0]["data"]) == 5
+    metadata = mitosis._disk.locate_trial_folder(exp_key, trials_folder=tmp_path)
+    assert (metadata / "experiment").resolve().exists()
 
 
-def test_empty_mod_logging_debug(tmp_path):
+def test_load_results_order(tmp_path):
+    exp_key = "test_results"
+    (tmp_path / exp_key).mkdir()
+    filename1 = "results1.dill"
+    filename2 = "results0.dill"
+    with open(tmp_path / exp_key / filename1, "wb") as f1:
+        pickle.dump("second", f1)
+    with open(tmp_path / exp_key / filename2, "wb") as f2:
+        pickle.dump("first", f2)
+    result = mitosis.load_trial_data(exp_key, trials_folder=tmp_path)
+    expected = ["first", "second"]
+    assert result == expected
+
+
+def test_mod_metadata_debug(mock_steps, tmp_path):
     hexstr = mitosis.run(
-        mock_experiment,
+        mock_steps,
         debug=True,
         trials_folder=tmp_path,
-        params=[],
     )
-    trial_folder = mitosis._locate_trial_folder(hexstr, trials_folder=tmp_path)
-    with open(trial_folder / f"{mock_experiment.__name__}.log") as f:
+    trial_folder = _disk.locate_trial_folder(hexstr, trials_folder=tmp_path)
+    with open(trial_folder / "experiment.log", "r") as f:
         log_str = "".join(f.readlines())
     assert "This is run every time" in log_str
     assert "This is run in debug mode only" in log_str
+    with open(trial_folder / "config.txt") as f:
+        config_lines = f.readlines()
+    config_params = [eval(line) for line in config_lines]
+    passed_params = [{p.arg_name: p.vals for p in step.args} for step in mock_steps]
+    assert config_params == passed_params
 
 
 @pytest.mark.clean
-def test_empty_mod_logging(tmp_path):
+def test_mod_metadata(mock_steps, tmp_path):
     hexstr = mitosis.run(
-        mock_experiment,
+        mock_steps,
         debug=False,
         trials_folder=tmp_path,
-        params=[],
     )
-    trial_folder = mitosis._locate_trial_folder(hexstr, trials_folder=tmp_path)
-    with open(trial_folder / f"{mock_experiment.__name__}.log") as f:
+    trial_folder = _disk.locate_trial_folder(hexstr, trials_folder=tmp_path)
+    with open(trial_folder / "experiment.log", "r") as f:
         log_str = "".join(f.readlines())
     assert "This is run every time" in log_str
     assert "This is run in debug mode only" not in log_str
+    with open(trial_folder / "config.txt") as f:
+        config_lines = f.readlines()
+    config_params = [eval(line) for line in config_lines]
+    passed_params = [{p.arg_name: p.vals for p in step.args} for step in mock_steps]
+    assert config_params == passed_params
 
 
-def test_malfored_return_experiment(tmp_path):
+def test_malfored_return_experiment(mock_steps, tmp_path):
+    bad_steps = [
+        mock_steps[0],
+        ExpStep(
+            mock_steps[1].name,
+            mock_part2.bad_runnable,  # type: ignore
+            "mitosis.tests.mock_part2:bad_runnable",
+            mock_steps[1].lookup,
+            mock_steps[1].lookup_ref,
+            mock_steps[1].group,
+            mock_steps[1].args,
+            mock_steps[1].untracked_args,
+        ),
+    ]
     with pytest.raises(nbclient.exceptions.CellExecutionError):
         mitosis.run(
-            bad_return_experiment,
+            bad_steps,
             debug=True,
             trials_folder=tmp_path,
-            params=[],
         )
 
 
-def test_cli(tmp_path):
-    subprocess.run(
-        ["which", "python3"],
-    )
-    subprocess.run(
-        [
-            "python3",
-            "-m",
-            "mitosis",
-            "mitosis.tests.mock_experiment",
-            "--param",
-            "foo=test",
-            "-e",
-            "seed=1" "-F",
-            str(tmp_path),
-        ],
-    )
+def test_load_toml():
+    parent = Path(__file__).resolve().parent
+    tomlfile = parent / "test_pyproject.toml"
+    result = _disk.load_mitosis_steps(tomlfile)
+    expected = {
+        "data": (
+            "mitosis.tests.mock_part1:Klass.gen_data",
+            "mitosis.tests.mock_paper:data_config",
+        ),
+        "fit_eval": (
+            "mitosis.tests.mock_part2:fit_and_score",
+            "mitosis.tests.mock_paper:meth_config",
+        ),
+    }
+    assert result == expected
 
 
-def run(foo):
-    return {"main": 0}
+def test_load_bad_toml():
+    parent = Path(__file__).resolve().parent
+    tomlfile = parent / "pyproject_missing.toml"
+    with pytest.raises(RuntimeError, match="does not have a tool"):
+        _disk.load_mitosis_steps(tomlfile)
+    tomlfile = parent / "pyproject_malformed.toml"
+    with pytest.raises(RuntimeError, match="table is malformed"):
+        _disk.load_mitosis_steps(tomlfile)
 
 
-name = "MockModuleExperiment"
+def test_unpack():
+    from importlib.metadata import version
+
+    obj_ref = "importlib.metadata:version"
+    result = unpack(obj_ref)
+    assert result is version

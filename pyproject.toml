@@ -14,7 +14,7 @@ authors = [
   {email = "jacob.stevens.haas@gmail.com", name = "Jake Stevens-Haas"}
 ]
 classifiers = [
-  "Development Status :: 1 - Planning",
+  "Development Status :: 4 - Beta",
   "Programming Language :: Python",
   "Framework :: Jupyter",
   "Intended Audience :: Developers",
@@ -42,15 +42,15 @@ dependencies = [
   "nbconvert",
   "nbclient",
   "nbformat",
-  "numpy",
-  "pandas",
-  "papermill",
+  "pandas<2.2",
   "sqlalchemy",
+  "toml",
+  "types-toml",
 ]
 
 [project.optional-dependencies]
 dev = [
-  "pytest >= 6.0.0",
+  "pytest >=6.0.0,<8.0.0",
   "pytest-cov",
   "flake8",
   "flake8-comprehensions>=3.1.0",
@@ -70,7 +70,11 @@ homepage = "https://github.com/Jacob-Stevens-Haas/mitosis"
 [project.scripts]
 mitosis="mitosis.__main__:main"
 
+[tool.setuptools]
+packages = ["mitosis"]
+
 [tool.setuptools_scm]
+version_file = "mitosis/_version.py"
 
 [tool.black]
 line-length = 88
